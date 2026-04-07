@@ -1,0 +1,12 @@
+torch>=1.12.0
+torchvision
+torch-scatter
+torch-geometric
+timm
+addict
+einops
+numpy
+# Optional: GPU sparse convolutions (choose version matching your CUDA)
+# spconv-cu118
+# Optional: faster attention on CUDA 11.6+
+# flash-attn
