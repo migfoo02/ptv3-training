@@ -6,7 +6,28 @@ timm
 addict
 einops
 numpy
+
+# ── SWISS Competition Forms pipeline ──────────────────────────────────────────
+
+# .3dm file loading (Rhino geometry)
+# On Python 3.14 there are no prebuilt wheels — must build from source.
+# First install cmake, then install rhino3dm with --no-build-isolation:
+#   pip install cmake
+#   pip install rhino3dm --no-build-isolation
+rhino3dm
+
+# Metadata reading
+openpyxl
+
+# Visualisation
+matplotlib
+scikit-learn     # t-SNE fallback
+
+# Better latent-space visualisation (optional but recommended)
+# umap-learn
+
 # Optional: GPU sparse convolutions (choose version matching your CUDA)
 # spconv-cu118
+
 # Optional: faster attention on CUDA 11.6+
 # flash-attn

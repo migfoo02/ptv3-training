@@ -1,17 +1,22 @@
 """
-Dummy Training Loop for Point Transformer V3 (PTv3)
-====================================================
+Training Loop for Point Transformer V3 (PTv3)
+=============================================
 Walks through the full pipeline:
 
-  DummyDataset → DataLoader → PTv3 backbone → SegHead
+  Dataset → DataLoader → PTv3 backbone → SegHead
       → CrossEntropyLoss → AdamW → backprop → mIoU eval
+
+Supports two dataset modes:
+  --dataset dummy   Synthetic point clouds (default, no extra files needed)
+  --dataset swiss   SWISS Competition Forms (requires running convert_3dm.py first)
 
 Runs on CPU or CUDA. On Mac, spconv falls back to the mock
 defined at the top of model.py, so no GPU/CUDA required.
 
 Usage:
     python train.py
-    python train.py --epochs 10 --batch-size 4 --lr 5e-4
+    python train.py --dataset swiss --data-dir data_npy
+    python train.py --dataset swiss --data-dir data_npy --epochs 50 --batch-size 4
 """
 
 import sys
@@ -23,20 +28,33 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+# Swiss dataset (imported lazily so the dummy path has no extra dependencies)
+_swiss_available = True
+try:
+    from dataset_swiss import SwissDataset, swiss_collate_fn
+except ImportError:
+    _swiss_available = False
+
 # ---------------------------------------------------------------------------- #
 # Configuration
 # ---------------------------------------------------------------------------- #
 
 CFG = {
+    # ── dummy dataset ──────────────────────────────────────────────────────
     "num_classes":      20,    # number of semantic classes (e.g. ScanNet-style)
     "num_scenes":       32,    # total dummy scenes in the dataset
     "points_per_scene": 2048,  # unique voxels per scene
     "grid_size":        0.05,  # voxel size in metres
+
+    # ── swiss dataset ──────────────────────────────────────────────────────
+    # (num_classes overridden to 26 at runtime when --dataset swiss is used)
+
+    # ── shared training ────────────────────────────────────────────────────
     "batch_size":       2,
     "num_epochs":       5,
     "lr":               1e-3,
     "weight_decay":     1e-4,
-    "val_split":        0.25,  # fraction of scenes held out for validation
+    "val_split":        0.2,   # fraction of scenes held out for validation
 
     # Small model for fast CPU demo
     # (default PTv3 uses enc_channels up to 512 — too slow on CPU)
@@ -285,10 +303,22 @@ def validate(model, head, loader, criterion, device, num_classes):
 # ---------------------------------------------------------------------------- #
 
 def main():
-    parser = argparse.ArgumentParser(description="PTv3 dummy training loop")
+    parser = argparse.ArgumentParser(description="PTv3 training loop")
     parser.add_argument("--epochs",     type=int,   default=CFG["num_epochs"])
     parser.add_argument("--batch-size", type=int,   default=CFG["batch_size"])
     parser.add_argument("--lr",         type=float, default=CFG["lr"])
+    parser.add_argument(
+        "--dataset", default="dummy", choices=["dummy", "swiss"],
+        help="'dummy' (synthetic, default) or 'swiss' (SWISS Competition Forms)",
+    )
+    parser.add_argument(
+        "--data-dir", default="data_npy",
+        help="Path to .npz files produced by convert_3dm.py (only used with --dataset swiss)",
+    )
+    parser.add_argument(
+        "--label-key", default="letter", choices=["letter", "repetitions"],
+        help="Which metadata field to use as class label for the swiss dataset",
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -302,31 +332,69 @@ def main():
     print(f"Device: {device}")
 
     # ── Dataset & DataLoaders ─────────────────────────────────────────────────
-    print("\n── Building dummy dataset ──")
-    dataset = DummyPointCloudDataset(
-        num_scenes=CFG["num_scenes"],
-        num_points=CFG["points_per_scene"],
-        num_classes=CFG["num_classes"],
-        grid_size=CFG["grid_size"],
-    )
-    n_val   = max(1, int(len(dataset) * CFG["val_split"]))
-    n_train = len(dataset) - n_val
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(0),
-    )
-    train_loader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=0,
-    )
-    val_loader = DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=0,
-    )
-    print(f"  {n_train} train scenes / {n_val} val scenes")
-    print(f"  {CFG['points_per_scene']} pts/scene  "
-          f"× {args.batch_size} batch = "
-          f"{CFG['points_per_scene'] * args.batch_size:,} pts/step")
+    if args.dataset == "swiss":
+        if not _swiss_available:
+            sys.exit(
+                "dataset_swiss.py not found. "
+                "Make sure it is in the same directory as train.py."
+            )
+        print(f"\n── Building SWISS Competition Forms dataset ──")
+        print(f"   data dir  : {args.data_dir}")
+        print(f"   label key : {args.label_key}")
+        train_set = SwissDataset(
+            args.data_dir, split="train",
+            val_fraction=CFG["val_split"],
+            label_key=args.label_key,
+            augment=True,
+        )
+        val_set = SwissDataset(
+            args.data_dir, split="val",
+            val_fraction=CFG["val_split"],
+            label_key=args.label_key,
+        )
+        num_classes = train_set.num_classes
+        coll_fn     = swiss_collate_fn
+
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size, shuffle=True,
+            collate_fn=coll_fn, num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=args.batch_size, shuffle=False,
+            collate_fn=coll_fn, num_workers=0,
+        )
+        print(f"  {len(train_set)} train scenes / {len(val_set)} val scenes")
+        print(f"  {num_classes} classes  ({train_set.label_key})")
+
+    else:
+        print("\n── Building dummy dataset ──")
+        dataset = DummyPointCloudDataset(
+            num_scenes=CFG["num_scenes"],
+            num_points=CFG["points_per_scene"],
+            num_classes=CFG["num_classes"],
+            grid_size=CFG["grid_size"],
+        )
+        n_val   = max(1, int(len(dataset) * CFG["val_split"]))
+        n_train = len(dataset) - n_val
+        train_set, val_set = torch.utils.data.random_split(
+            dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(0),
+        )
+        num_classes = CFG["num_classes"]
+        coll_fn     = collate_fn
+
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size, shuffle=True,
+            collate_fn=coll_fn, num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=args.batch_size, shuffle=False,
+            collate_fn=coll_fn, num_workers=0,
+        )
+        print(f"  {n_train} train scenes / {n_val} val scenes")
+        print(f"  {CFG['points_per_scene']} pts/scene  "
+              f"× {args.batch_size} batch = "
+              f"{CFG['points_per_scene'] * args.batch_size:,} pts/step")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\n── Initialising PTv3 ──")
@@ -336,8 +404,8 @@ def main():
     print(f"  Backbone parameters: {num_params:,}")
 
     head_in = CFG["model_kwargs"]["dec_channels"][0]  # = 32 with our tiny config
-    head = SegHead(head_in, CFG["num_classes"]).to(device)
-    print(f"  SegHead: {head_in} → {CFG['num_classes']} classes")
+    head = SegHead(head_in, num_classes).to(device)
+    print(f"  SegHead: {head_in} → {num_classes} classes")
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
     # AdamW + OneCycleLR is a strong baseline for 3-D perception tasks.
@@ -379,7 +447,7 @@ def main():
 
         # ── Validate ─────────────────────────────────────────────────────────
         val_loss, val_miou = validate(
-            model, head, val_loader, criterion, device, CFG["num_classes"],
+            model, head, val_loader, criterion, device, num_classes,
         )
 
         history["train_loss"].append(train_loss)
@@ -397,12 +465,16 @@ def main():
         if val_miou >= best_miou:
             best_miou = val_miou
             ckpt = {
-                "epoch":      epoch + 1,
-                "model":      model.state_dict(),
-                "head":       head.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "val_miou":   val_miou,
-                "val_loss":   val_loss,
+                "epoch":        epoch + 1,
+                "model":        model.state_dict(),
+                "head":         head.state_dict(),
+                "optimizer":    optimizer.state_dict(),
+                "val_miou":     val_miou,
+                "val_loss":     val_loss,
+                # Stored so visualize_latent.py can rebuild the model exactly
+                "model_kwargs": CFG["model_kwargs"],
+                "num_classes":  num_classes,
+                "dataset":      args.dataset,
             }
             torch.save(ckpt, "best_model.pth")
             print(f"  >> checkpoint saved  (best val mIoU = {best_miou:.4f})")
