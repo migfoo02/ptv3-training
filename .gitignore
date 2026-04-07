@@ -6,3 +6,19 @@ __pycache__/
 dist/
 build/
 .DS_Store
+
+# Raw dataset (binary assets / external data — regenerate is not possible, store externally)
+SWISS Competition Forms/
+*.3dm
+*.xlsx
+
+# Converted point cloud cache (derived output — regenerate with convert_3dm.py)
+data_npy/
+
+# Visualisation outputs
+*.png
+latent_*.npz
+
+# Virtual environments
+.venv/
+.venv*/
