@@ -231,7 +231,7 @@ def plot_latent(
         sys.exit("matplotlib not installed.  pip install matplotlib")
 
     num_classes = len(class_names)
-    cmap        = cm.get_cmap("tab20", num_classes)
+    cmap        = plt.colormaps.get_cmap("tab20").resampled(num_classes)
 
     fig, ax = plt.subplots(figsize=(12, 9))
 

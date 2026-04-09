@@ -66,8 +66,8 @@ CFG = {
         enc_num_head=(1, 2, 4, 8, 16),
         enc_patch_size=(64, 64, 64, 64, 64),
         dec_depths=(1, 1, 1, 1),
-        dec_channels=(32, 32, 64, 128),  # dec_channels[0]=32 → head input dim
-        dec_num_head=(2, 2, 4, 8),
+        dec_channels=(64, 64, 128, 256),  # dec_channels[0]=64 → head input dim (2× wider)
+        dec_num_head=(4, 4, 8, 16),
         dec_patch_size=(64, 64, 64, 64),
         mlp_ratio=2.0,
         drop_path=0.0,
@@ -183,18 +183,16 @@ class GlobalPoolHead(nn.Module):
     """
     Scene-level classification head.
 
-    Mean-pools per-point decoder features [total_N, C] into one vector per
-    scene [B, C] via scatter_mean, then projects to class logits [B, num_classes].
-    This is the correct head for learning discriminative latent representations:
-    the loss gradient is on the scene level, so the backbone must encode
-    discriminative geometry into its per-point features rather than a constant
-    scene-wide prediction.
+    Concatenates mean-pool and max-pool of per-point decoder features:
+      mean: global shape statistics (overall layout)
+      max:  most discriminative local feature per channel (sharp corners, endpoints)
+    The 2C-dimensional concatenation is projected to class logits.
     """
 
     def __init__(self, in_channels: int, num_classes: int):
         super().__init__()
-        self.norm = nn.LayerNorm(in_channels)
-        self.fc   = nn.Linear(in_channels, num_classes)
+        self.norm = nn.LayerNorm(in_channels * 2)
+        self.fc   = nn.Linear(in_channels * 2, num_classes)
 
     def forward(
         self,
@@ -202,8 +200,10 @@ class GlobalPoolHead(nn.Module):
         batch: torch.Tensor,  # [total_N], long — scene index per point
         batch_size: int,      # B
     ) -> torch.Tensor:        # [B, num_classes]
-        from torch_scatter import scatter_mean
-        pooled = scatter_mean(feat, batch, dim=0, dim_size=batch_size)  # [B, C]
+        from torch_scatter import scatter_mean, scatter_max
+        mean_pool = scatter_mean(feat, batch, dim=0, dim_size=batch_size)   # [B, C]
+        max_pool, _ = scatter_max(feat, batch, dim=0, out=torch.zeros_like(mean_pool))  # [B, C]
+        pooled = torch.cat([mean_pool, max_pool], dim=-1)                   # [B, 2C]
         return self.fc(self.norm(pooled))
 
 
@@ -318,6 +318,7 @@ def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
             loss         = criterion(logits, scene_labels)
 
             # Optional supervised contrastive loss (stage 2)
+            # Use mean-pool only for SupCon (stable, no scatter_max fill issues)
             if supcon_criterion is not None and supcon_alpha > 0:
                 from torch_scatter import scatter_mean
                 pooled = scatter_mean(
