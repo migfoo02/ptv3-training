@@ -179,9 +179,91 @@ class SegHead(nn.Module):
         return self.fc(self.norm(x))
 
 
+class GlobalPoolHead(nn.Module):
+    """
+    Scene-level classification head.
+
+    Mean-pools per-point decoder features [total_N, C] into one vector per
+    scene [B, C] via scatter_mean, then projects to class logits [B, num_classes].
+    This is the correct head for learning discriminative latent representations:
+    the loss gradient is on the scene level, so the backbone must encode
+    discriminative geometry into its per-point features rather than a constant
+    scene-wide prediction.
+    """
+
+    def __init__(self, in_channels: int, num_classes: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_channels)
+        self.fc   = nn.Linear(in_channels, num_classes)
+
+    def forward(
+        self,
+        feat: torch.Tensor,   # [total_N, C]
+        batch: torch.Tensor,  # [total_N], long — scene index per point
+        batch_size: int,      # B
+    ) -> torch.Tensor:        # [B, num_classes]
+        from torch_scatter import scatter_mean
+        pooled = scatter_mean(feat, batch, dim=0, dim_size=batch_size)  # [B, C]
+        return self.fc(self.norm(pooled))
+
+
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
+
+    Expects L2-normalised embeddings. Pulls same-class pairs together and
+    pushes different-class pairs apart on the unit hypersphere.
+
+    Parameters
+    ----------
+    temperature : τ — sharpness of the softmax (default 0.07)
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(
+        self,
+        features: torch.Tensor,  # [B, C], L2-normalised
+        labels: torch.Tensor,    # [B], long
+    ) -> torch.Tensor:
+        device = features.device
+        B = features.shape[0]
+        if B < 2:
+            return torch.tensor(0.0, device=device)
+
+        # Pairwise cosine similarities (unit sphere → dot product)
+        sim = torch.mm(features, features.T) / self.temperature  # [B, B]
+
+        # Positive mask: same label, different index
+        lrow     = labels.unsqueeze(1)
+        lcol     = labels.unsqueeze(0)
+        pos_mask = (lrow == lcol).float()
+        self_mask = torch.eye(B, dtype=torch.float, device=device)
+        pos_mask  = pos_mask - self_mask
+
+        if pos_mask.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        # Numerically stable log-sum-exp over non-self pairs
+        sim_max  = sim.max(dim=1, keepdim=True).values.detach()
+        exp_sim  = torch.exp(sim - sim_max) * (1 - self_mask)
+        log_prob = (sim - sim_max) - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+        pos_count = pos_mask.sum(dim=1).clamp(min=1)
+        loss = -(pos_mask * log_prob).sum(dim=1) / pos_count
+        return loss.mean()
+
+
 # ---------------------------------------------------------------------------- #
 # Metrics
 # ---------------------------------------------------------------------------- #
+
+def compute_accuracy(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Top-1 scene-level accuracy."""
+    return (pred == target).float().mean().item()
+
 
 def compute_miou(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> float:
     """
@@ -208,51 +290,54 @@ def compute_miou(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> 
 # ---------------------------------------------------------------------------- #
 
 def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
-                    device, epoch, num_epochs):
+                    device, epoch, num_epochs,
+                    head_type="seg", supcon_criterion=None,
+                    supcon_alpha=0.0):
     model.train()
     head.train()
     total_loss = 0.0
     t0 = time.time()
 
     for step, batch in enumerate(loader):
-        # ── 1. Prepare input dict for PTv3 ──────────────────────────────────
-        #    PTv3.forward() expects a plain dict with these keys:
-        #      "coord"     – raw XYZ             [total_N, 3]
-        #      "feat"      – point features       [total_N, 6]
-        #      "batch"     – scene index per pt   [total_N]  (long)
-        #      "grid_size" – voxel size (scalar float)
         data_dict = {
             "coord":     batch["coord"].to(device),
             "feat":      batch["feat"].to(device),
             "batch":     batch["batch"].to(device),
             "grid_size": batch["grid_size"],
         }
-        labels = batch["label"].to(device)          # [total_N]
 
-        # ── 2. PTv3 forward pass ─────────────────────────────────────────────
-        #    Internally this runs:
-        #      a) Point.serialization()  – assign Z-order / Hilbert codes
-        #      b) Point.sparsify()       – build SparseConvTensor
-        #      c) self.embedding         – initial SubMConv3d embedding
-        #      d) self.enc               – 5-stage encoder (pooling + blocks)
-        #      e) self.dec               – 4-stage decoder (unpooling + blocks)
-        #    Returns a Point object; output.feat is [total_N, dec_channels[0]]
         output = model(data_dict)
 
-        # ── 3. Segmentation head → logits ────────────────────────────────────
-        logits = head(output.feat)                  # [total_N, num_classes]
+        if head_type == "global_cls":
+            # ── Scene-level classification ───────────────────────────────────
+            #    GlobalPoolHead mean-pools per-point features → one vector per
+            #    scene → linear classifier.  Loss on scene labels [B], not [N].
+            batch_size   = int(output.batch.max().item()) + 1
+            logits       = head(output.feat, output.batch, batch_size)  # [B, K]
+            scene_labels = batch["scene_label"].to(device)              # [B]
+            loss         = criterion(logits, scene_labels)
 
-        # ── 4. Loss ──────────────────────────────────────────────────────────
-        loss = criterion(logits, labels)
+            # Optional supervised contrastive loss (stage 2)
+            if supcon_criterion is not None and supcon_alpha > 0:
+                from torch_scatter import scatter_mean
+                pooled = scatter_mean(
+                    output.feat, output.batch, dim=0, dim_size=batch_size
+                )                                                        # [B, C]
+                normed = pooled / (pooled.norm(dim=1, keepdim=True) + 1e-8)
+                loss   = loss + supcon_alpha * supcon_criterion(normed, scene_labels)
+        else:
+            # ── Per-point segmentation (legacy / dummy dataset) ──────────────
+            labels = batch["label"].to(device)                          # [total_N]
+            logits = head(output.feat)                                  # [total_N, K]
+            loss   = criterion(logits, labels)
 
-        # ── 5. Backward pass ─────────────────────────────────────────────────
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             list(model.parameters()) + list(head.parameters()), max_norm=1.0
         )
         optimizer.step()
-        scheduler.step()  # OneCycleLR advances per step
+        scheduler.step()
 
         total_loss += loss.item()
         elapsed = time.time() - t0
@@ -268,7 +353,7 @@ def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
 
 
 @torch.no_grad()
-def validate(model, head, loader, criterion, device, num_classes):
+def validate(model, head, loader, criterion, device, num_classes, head_type="seg"):
     model.eval()
     head.eval()
     total_loss = 0.0
@@ -281,21 +366,30 @@ def validate(model, head, loader, criterion, device, num_classes):
             "batch":     batch["batch"].to(device),
             "grid_size": batch["grid_size"],
         }
-        labels = batch["label"].to(device)
 
         output = model(data_dict)
-        logits = head(output.feat)
-        total_loss += criterion(logits, labels).item()
 
-        all_pred.append(logits.argmax(dim=-1))
-        all_target.append(labels)
+        if head_type == "global_cls":
+            batch_size   = int(output.batch.max().item()) + 1
+            logits       = head(output.feat, output.batch, batch_size)
+            scene_labels = batch["scene_label"].to(device)
+            total_loss  += criterion(logits, scene_labels).item()
+            all_pred.append(logits.argmax(dim=-1))
+            all_target.append(scene_labels)
+        else:
+            labels = batch["label"].to(device)
+            logits = head(output.feat)
+            total_loss += criterion(logits, labels).item()
+            all_pred.append(logits.argmax(dim=-1))
+            all_target.append(labels)
 
-    miou = compute_miou(
-        torch.cat(all_pred),
-        torch.cat(all_target),
-        num_classes,
-    )
-    return total_loss / len(loader), miou
+    pred_all   = torch.cat(all_pred)
+    target_all = torch.cat(all_target)
+    if head_type == "global_cls":
+        metric = compute_accuracy(pred_all, target_all)
+    else:
+        metric = compute_miou(pred_all, target_all, num_classes)
+    return total_loss / len(loader), metric
 
 
 # ---------------------------------------------------------------------------- #
@@ -318,6 +412,23 @@ def main():
     parser.add_argument(
         "--label-key", default="letter", choices=["letter", "repetitions"],
         help="Which metadata field to use as class label for the swiss dataset",
+    )
+    parser.add_argument(
+        "--head-type", default="global_cls", choices=["seg", "global_cls"],
+        help="'global_cls' pools per-point features to scene level (recommended); "
+             "'seg' uses per-point broadcast labels (legacy)",
+    )
+    parser.add_argument(
+        "--stage", type=int, default=1, choices=[1, 2],
+        help="Training stage: 1=CE only, 2=CE+SupCon fine-tuning (requires --checkpoint)",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="Path to checkpoint to resume from (required for --stage 2)",
+    )
+    parser.add_argument(
+        "--supcon-alpha", type=float, default=0.5,
+        help="Max weight for SupCon loss in stage 2 (ramped over first 10 epochs)",
     )
     args = parser.parse_args()
 
@@ -403,35 +514,68 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Backbone parameters: {num_params:,}")
 
-    head_in = CFG["model_kwargs"]["dec_channels"][0]  # = 32 with our tiny config
-    head = SegHead(head_in, num_classes).to(device)
-    print(f"  SegHead: {head_in} → {num_classes} classes")
+    head_in   = CFG["model_kwargs"]["dec_channels"][0]  # 32 with small config
+    head_type = args.head_type if args.dataset == "swiss" else "seg"
+    if head_type == "global_cls":
+        head = GlobalPoolHead(head_in, num_classes).to(device)
+        print(f"  GlobalPoolHead: {head_in}→pool→{num_classes} classes")
+    else:
+        head = SegHead(head_in, num_classes).to(device)
+        print(f"  SegHead: {head_in}→{num_classes} classes")
+
+    # ── Load checkpoint for stage 2 ───────────────────────────────────────────
+    if args.stage == 2:
+        if args.checkpoint is None:
+            sys.exit("--stage 2 requires --checkpoint pointing to stage-1 weights.")
+        ckpt_data = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt_data["model"])
+        head.load_state_dict(ckpt_data["head"])
+        print(f"  Loaded stage-1 checkpoint: {args.checkpoint}  "
+              f"(epoch {ckpt_data.get('epoch','?')})")
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    # AdamW + OneCycleLR is a strong baseline for 3-D perception tasks.
-    # OneCycleLR provides a warmup phase followed by cosine annealing and is
-    # advanced *per step* (not per epoch) inside train_one_epoch.
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(head.parameters()),
         lr=args.lr,
         weight_decay=CFG["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        steps_per_epoch=len(train_loader),
-        epochs=args.epochs,
-    )
+    if args.stage == 2:
+        # Fine-tuning: cosine decay from current LR, no warmup
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs * len(train_loader),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            steps_per_epoch=len(train_loader),
+            epochs=args.epochs,
+        )
 
     # ── Loss ──────────────────────────────────────────────────────────────────
-    criterion = nn.CrossEntropyLoss()
+    if args.dataset == "swiss" and head_type == "global_cls":
+        # Class-weighted CE: compensates for imbalance (U=12 vs K=35 samples)
+        from collections import Counter
+        counts = Counter(train_set[i]["scene_label"] for i in range(len(train_set)))
+        weight_vec = torch.tensor(
+            [len(train_set) / (num_classes * max(counts.get(c, 1), 1))
+             for c in range(num_classes)],
+            dtype=torch.float32,
+        ).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weight_vec)
+    else:
+        criterion = nn.CrossEntropyLoss()
+
+    supcon_criterion = SupConLoss(temperature=0.07).to(device) if args.stage == 2 else None
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    best_miou = 0.0
-    history   = {"train_loss": [], "val_loss": [], "val_miou": []}
+    best_metric = 0.0
+    metric_name = "acc" if head_type == "global_cls" else "mIoU"
+    history     = {"train_loss": [], "val_loss": [], f"val_{metric_name}": []}
 
     print("\n" + "=" * 60)
-    print(f"Training for {args.epochs} epochs")
+    print(f"Training stage {args.stage} for {args.epochs} epochs  "
+          f"(head={head_type}, metric={metric_name})")
     print("=" * 60)
 
     for epoch in range(args.epochs):
@@ -439,55 +583,65 @@ def main():
         print(f"  EPOCH {epoch + 1} / {args.epochs}")
         print(f"{'─' * 60}")
 
-        # ── Train ────────────────────────────────────────────────────────────
+        # SupCon alpha ramps from 0 → supcon_alpha over the first 10 epochs of stage 2
+        current_alpha = (
+            min(args.supcon_alpha, args.supcon_alpha * (epoch + 1) / 10)
+            if args.stage == 2 else 0.0
+        )
+
         train_loss = train_one_epoch(
             model, head, train_loader, optimizer, scheduler,
             criterion, device, epoch, args.epochs,
+            head_type=head_type,
+            supcon_criterion=supcon_criterion,
+            supcon_alpha=current_alpha,
         )
 
-        # ── Validate ─────────────────────────────────────────────────────────
-        val_loss, val_miou = validate(
+        val_loss, val_metric = validate(
             model, head, val_loader, criterion, device, num_classes,
+            head_type=head_type,
         )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        history["val_miou"].append(val_miou)
+        history[f"val_{metric_name}"].append(val_metric)
 
         print(
             f"\n  >> EPOCH {epoch+1} SUMMARY"
             f"  train_loss={train_loss:.4f}"
             f"  val_loss={val_loss:.4f}"
-            f"  val_mIoU={val_miou:.4f}"
+            f"  val_{metric_name}={val_metric:.4f}"
+            + (f"  supcon_α={current_alpha:.3f}" if args.stage == 2 else "")
         )
 
         # ── Checkpoint ───────────────────────────────────────────────────────
-        if val_miou >= best_miou:
-            best_miou = val_miou
+        if val_metric >= best_metric:
+            best_metric = val_metric
             ckpt = {
                 "epoch":        epoch + 1,
                 "model":        model.state_dict(),
                 "head":         head.state_dict(),
                 "optimizer":    optimizer.state_dict(),
-                "val_miou":     val_miou,
+                "val_miou":     val_metric,   # keep key for visualize_latent.py compat
                 "val_loss":     val_loss,
-                # Stored so visualize_latent.py can rebuild the model exactly
                 "model_kwargs": CFG["model_kwargs"],
                 "num_classes":  num_classes,
                 "dataset":      args.dataset,
+                "head_type":    head_type,
+                "stage":        args.stage,
             }
             torch.save(ckpt, "best_model.pth")
-            print(f"  >> checkpoint saved  (best val mIoU = {best_miou:.4f})")
+            print(f"  >> checkpoint saved  (best val {metric_name} = {best_metric:.4f})")
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Training complete")
-    print(f"  Best val mIoU : {best_miou:.4f}")
-    print("  Loss curve    :")
+    print(f"  Best val {metric_name}: {best_metric:.4f}")
+    print("  Curve:")
     for i, (tl, vl, vm) in enumerate(
-        zip(history["train_loss"], history["val_loss"], history["val_miou"])
+        zip(history["train_loss"], history["val_loss"], history[f"val_{metric_name}"])
     ):
-        print(f"    epoch {i+1:02d}  train={tl:.4f}  val={vl:.4f}  mIoU={vm:.4f}")
+        print(f"    epoch {i+1:02d}  train={tl:.4f}  val={vl:.4f}  {metric_name}={vm:.4f}")
     print("=" * 60)
 
 

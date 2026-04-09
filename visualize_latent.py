@@ -170,7 +170,7 @@ def _reduce_tsne(X, seed):
     from sklearn.manifold import TSNE  # type: ignore
     perplexity = min(30, max(5, len(X) // 10))
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=seed,
-                n_iter=1000, init="pca")
+                max_iter=1000, init="pca")
     return tsne.fit_transform(X)
 
 
@@ -285,6 +285,132 @@ def plot_latent(
     plt.close(fig)
 
 
+# ── Quantitative metrics ──────────────────────────────────────────────────────
+
+def compute_metrics(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    k: int = 5,
+) -> dict:
+    """
+    Quantitative embedding quality metrics.
+
+    Returns dict with keys: silhouette, knn_acc, within_dist, between_dist,
+    dist_ratio (within/between, lower = better), class_dist_matrix [K, K].
+    """
+    from sklearn.metrics import silhouette_score
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.model_selection import cross_val_score
+    from sklearn.preprocessing import normalize
+
+    X = normalize(embeddings, norm="l2")
+
+    sil = silhouette_score(X, labels, metric="euclidean")
+
+    knn = KNeighborsClassifier(n_neighbors=k, metric="euclidean", n_jobs=-1)
+    cv  = min(5, min(np.bincount(labels).tolist()))  # can't have more folds than min class count
+    cv  = max(2, cv)
+    knn_acc = float(cross_val_score(knn, X, labels, cv=cv, scoring="accuracy").mean())
+
+    num_classes = int(labels.max()) + 1
+    within_dists = []
+    for c in range(num_classes):
+        pts = X[labels == c]
+        if len(pts) < 2:
+            continue
+        d = np.linalg.norm(pts[:, None] - pts[None, :], axis=-1)
+        within_dists.append(d[np.triu_indices(len(pts), k=1)].mean())
+    within_dist = float(np.mean(within_dists)) if within_dists else 0.0
+
+    dist_matrix = np.zeros((num_classes, num_classes), dtype=np.float32)
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i == j:
+                continue
+            pi, pj = X[labels == i], X[labels == j]
+            if len(pi) == 0 or len(pj) == 0:
+                continue
+            dist_matrix[i, j] = np.linalg.norm(pi[:, None] - pj[None, :], axis=-1).mean()
+
+    between_dist = float(dist_matrix[dist_matrix > 0].mean()) if (dist_matrix > 0).any() else 1.0
+    dist_ratio   = within_dist / (between_dist + 1e-8)
+
+    return {
+        "silhouette":        sil,
+        "knn_acc":           knn_acc,
+        "within_dist":       within_dist,
+        "between_dist":      between_dist,
+        "dist_ratio":        dist_ratio,
+        "class_dist_matrix": dist_matrix,
+    }
+
+
+# ── Additional plot functions ─────────────────────────────────────────────────
+
+def plot_repetition_scatter(
+    coords_2d: np.ndarray,
+    rep_labels: np.ndarray,
+    method_name: str,
+    output_path: str = None,
+    show: bool = True,
+):
+    """2-D scatter coloured by repetition level (1–4)."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        sys.exit("matplotlib not installed.  pip install matplotlib")
+
+    rep_names = ["single", "double", "triple", "quadruple"]
+    colors    = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    fig, ax   = plt.subplots(figsize=(10, 8))
+    for r, (name, color) in enumerate(zip(rep_names, colors), start=1):
+        mask = rep_labels == r
+        if mask.sum() == 0:
+            continue
+        ax.scatter(coords_2d[mask, 0], coords_2d[mask, 1],
+                   c=color, label=f"{r}× ({name})", alpha=0.75, s=40, edgecolors="none")
+    ax.legend(title="Repetitions", bbox_to_anchor=(1.01, 1), loc="upper left")
+    ax.set_title(f"PTv3 Latent Space — {method_name} (coloured by repetition)")
+    ax.set_xlabel(f"{method_name} dim 1")
+    ax.set_ylabel(f"{method_name} dim 2")
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"  Figure saved → {output_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_distance_matrix(
+    dist_matrix: np.ndarray,
+    class_names: list,
+    output_path: str = None,
+    show: bool = True,
+):
+    """Heatmap of mean pairwise L2 distances between the K letter classes."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        sys.exit("matplotlib not installed.  pip install matplotlib")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(dist_matrix, cmap="viridis_r", aspect="auto")
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, fontsize=8)
+    ax.set_yticklabels(class_names, fontsize=8)
+    plt.colorbar(im, ax=ax, label="Mean L2 distance (L2-normalised embeddings)")
+    ax.set_title("26×26 Mean Inter-class Embedding Distance\n(darker = closer, better separation = dark diagonal blocks)")
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"  Figure saved → {output_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -304,8 +430,8 @@ def main():
         help="Which split to embed (default: all)",
     )
     parser.add_argument(
-        "--source", default="decoder", choices=["decoder", "encoder"],
-        help="Which features to pool: 'decoder' (default) or 'encoder' bottleneck",
+        "--source", default="encoder", choices=["decoder", "encoder"],
+        help="Which features to pool: 'encoder' bottleneck (default, 256D) or 'decoder' (32D)",
     )
     parser.add_argument(
         "--method", default="auto", choices=["auto", "umap", "tsne", "pca"],
@@ -315,12 +441,16 @@ def main():
         "--batch-size", type=int, default=4,
     )
     parser.add_argument(
-        "--output", default=None,
-        help="Path to save the figure (e.g. latent.png). Optional.",
+        "--output-dir", default=".",
+        help="Directory for saving output figures (default: current dir)",
     )
     parser.add_argument(
         "--no-show", action="store_true",
         help="Do not call plt.show() (useful for headless environments)",
+    )
+    parser.add_argument(
+        "--no-metrics", action="store_true",
+        help="Skip silhouette / k-NN computation (for quick visual checks)",
     )
     parser.add_argument(
         "--save-embeddings", default=None,
@@ -330,6 +460,10 @@ def main():
         "--seed", type=int, default=42,
     )
     args = parser.parse_args()
+
+    from pathlib import Path
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Device ───────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -356,7 +490,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"  Epoch {ckpt.get('epoch', '?')}  |  "
-          f"val_mIoU={ckpt.get('val_miou', float('nan')):.4f}")
+          f"val_metric={ckpt.get('val_miou', float('nan')):.4f}")
 
     # ── Extract embeddings ────────────────────────────────────────────────────
     print(f"\nExtracting {args.source} embeddings for {len(ds)} scenes …")
@@ -376,26 +510,60 @@ def main():
         )
         print(f"  Embeddings saved → {args.save_embeddings}")
 
+    # ── Quantitative metrics ──────────────────────────────────────────────────
+    if not args.no_metrics:
+        print("\nComputing metrics …")
+        m = compute_metrics(embeddings, labels)
+        print(
+            f"\n── Embedding Quality Metrics ─────────────────────────\n"
+            f"  Silhouette score    : {m['silhouette']:+.4f}  (higher = better, max 1)\n"
+            f"  5-NN accuracy (CV)  : {m['knn_acc']*100:.1f} %\n"
+            f"  Within-class dist   : {m['within_dist']:.4f}\n"
+            f"  Between-class dist  : {m['between_dist']:.4f}\n"
+            f"  Within/Between ratio: {m['dist_ratio']:.4f}  (lower = better)\n"
+            f"─────────────────────────────────────────────────────"
+        )
+
     # ── Dimensionality reduction ──────────────────────────────────────────────
     print(f"\nReducing to 2D with method='{args.method}' …")
     coords_2d, method_name = reduce_2d(embeddings, args.method, seed=args.seed)
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    print(f"\nPlotting …")
-    output_path = args.output or (
-        f"latent_{args.source}_{method_name.lower()}.png"
-        if not (args.no_show and args.output is None) else None
-    )
+    # ── Load repetition labels from .npz files ────────────────────────────────
+    data_path = Path(args.data_dir)
+    rep_labels = np.array([
+        int(np.load(data_path / f"{fn}.npz")["repetitions"][0])
+        for fn in filenames
+    ])
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    show = not args.no_show
+    mn   = method_name.lower()
+
+    print("\nPlotting …")
     plot_latent(
-        coords_2d  = coords_2d,
-        labels     = labels,
-        filenames  = filenames,
-        method_name= method_name,
-        source     = args.source,
-        class_names= ds.class_names,
-        output_path= output_path,
-        show       = not args.no_show,
+        coords_2d   = coords_2d,
+        labels      = labels,
+        filenames   = filenames,
+        method_name = method_name,
+        source      = args.source,
+        class_names = ds.class_names,
+        output_path = str(out_dir / f"latent_letter_{mn}.png"),
+        show        = show,
     )
+    plot_repetition_scatter(
+        coords_2d   = coords_2d,
+        rep_labels  = rep_labels,
+        method_name = method_name,
+        output_path = str(out_dir / f"latent_repetition_{mn}.png"),
+        show        = show,
+    )
+    if not args.no_metrics:
+        plot_distance_matrix(
+            dist_matrix = m["class_dist_matrix"],
+            class_names = ds.class_names,
+            output_path = str(out_dir / "latent_distmatrix.png"),
+            show        = show,
+        )
 
     print("\nDone.")
 

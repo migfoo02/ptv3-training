@@ -157,9 +157,11 @@ class SwissDataset(Dataset):
 
 def _augment(coord: np.ndarray, normal: np.ndarray):
     """
-    Light augmentation for training:
-      - Random jitter (Gaussian noise, σ=0.01, clipped to ±0.05)
+    Training augmentation:
+      - Gaussian jitter (σ=0.01, clipped to ±0.05)
       - Random horizontal flip (50 % chance each axis)
+      - Random Z-axis rotation (uniform 0–2π): invariance to plan-view azimuth
+      - Anisotropic scale [0.85, 1.15]: invariance to letterform stretch
     """
     jitter = np.clip(np.random.normal(0, 0.01, coord.shape), -0.05, 0.05)
     coord  = coord + jitter.astype(np.float32)
@@ -169,6 +171,18 @@ def _augment(coord: np.ndarray, normal: np.ndarray):
         if np.random.random() < 0.5:
             coord[:, axis]  = -coord[:, axis]
             normal[:, axis] = -normal[:, axis]
+
+    # Z-axis rotation: rotate XY plane, preserve Z
+    theta = np.random.uniform(0, 2 * np.pi)
+    c, s  = np.cos(theta), np.sin(theta)
+    R_xy  = np.array([[c, -s], [s, c]], dtype=np.float32)
+    coord[:, :2]  = coord[:, :2]  @ R_xy.T
+    normal[:, :2] = normal[:, :2] @ R_xy.T
+
+    # Anisotropic scale per axis [0.85, 1.15] — renormalise normals afterward
+    scale  = np.random.uniform(0.85, 1.15, size=(1, 3)).astype(np.float32)
+    coord  = coord * scale
+    normal = normal / (np.linalg.norm(normal, axis=1, keepdims=True) + 1e-8)
 
     return coord, normal
 
