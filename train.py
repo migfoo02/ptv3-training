@@ -207,6 +207,52 @@ class GlobalPoolHead(nn.Module):
         return self.fc(self.norm(pooled))
 
 
+class EncAuxHead(nn.Module):
+    """
+    Auxiliary classification head placed directly on the encoder bottleneck.
+
+    Registers a forward hook on model.enc so the encoder gets a DIRECT
+    loss signal without gradient having to travel back through 4 decoder
+    stages.  This is the primary fix for poor encoder embedding quality:
+    the decoder head alone produces an indirect, attenuated gradient to
+    the encoder.
+
+    Usage
+    -----
+    # Register once before the training loop:
+    cache   = {}
+    handle  = model.enc.register_forward_hook(enc_aux_head.make_hook(cache))
+
+    # Inside train_one_epoch, after model(data_dict):
+    if cache:
+        enc_logits = enc_aux_head(cache["feat"], cache["batch"], batch_size)
+        loss += enc_aux_weight * criterion(enc_logits, scene_labels)
+    """
+
+    def __init__(self, in_channels: int, num_classes: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_channels)
+        self.fc   = nn.Linear(in_channels, num_classes)
+
+    def forward(
+        self,
+        feat: torch.Tensor,   # [M, enc_channels[-1]], M ≈ N/16
+        batch: torch.Tensor,  # [M], long
+        batch_size: int,
+    ) -> torch.Tensor:        # [B, num_classes]
+        from torch_scatter import scatter_mean
+        pooled = scatter_mean(feat, batch, dim=0, dim_size=batch_size)  # [B, C]
+        return self.fc(self.norm(pooled))
+
+    @staticmethod
+    def make_hook(cache: dict):
+        """Return a forward hook that stores encoder output in `cache`."""
+        def _hook(module, inp, out):
+            cache["feat"]  = out.feat
+            cache["batch"] = out.batch
+        return _hook
+
+
 class SupConLoss(nn.Module):
     """
     Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
@@ -292,7 +338,8 @@ def compute_miou(pred: torch.Tensor, target: torch.Tensor, num_classes: int) -> 
 def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
                     device, epoch, num_epochs,
                     head_type="seg", supcon_criterion=None,
-                    supcon_alpha=0.0):
+                    supcon_alpha=0.0,
+                    enc_aux_head=None, enc_cache=None, enc_aux_weight=0.0):
     model.train()
     head.train()
     total_loss = 0.0
@@ -310,15 +357,21 @@ def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
 
         if head_type == "global_cls":
             # ── Scene-level classification ───────────────────────────────────
-            #    GlobalPoolHead mean-pools per-point features → one vector per
-            #    scene → linear classifier.  Loss on scene labels [B], not [N].
             batch_size   = int(output.batch.max().item()) + 1
             logits       = head(output.feat, output.batch, batch_size)  # [B, K]
             scene_labels = batch["scene_label"].to(device)              # [B]
             loss         = criterion(logits, scene_labels)
 
-            # Optional supervised contrastive loss (stage 2)
-            # Use mean-pool only for SupCon (stable, no scatter_max fill issues)
+            # ── Auxiliary encoder head (direct encoder supervision) ──────────
+            #    Gives the encoder a short gradient path, bypassing the decoder.
+            if enc_aux_head is not None and enc_cache and enc_aux_weight > 0:
+                enc_batch_size = int(enc_cache["batch"].max().item()) + 1
+                enc_logits = enc_aux_head(
+                    enc_cache["feat"], enc_cache["batch"], enc_batch_size
+                )
+                loss = loss + enc_aux_weight * criterion(enc_logits, scene_labels)
+
+            # ── Optional supervised contrastive loss (stage 2) ───────────────
             if supcon_criterion is not None and supcon_alpha > 0:
                 from torch_scatter import scatter_mean
                 pooled = scatter_mean(
@@ -334,9 +387,10 @@ def train_one_epoch(model, head, loader, optimizer, scheduler, criterion,
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(head.parameters()), max_norm=1.0
-        )
+        all_params = list(model.parameters()) + list(head.parameters())
+        if enc_aux_head is not None:
+            all_params += list(enc_aux_head.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
@@ -431,6 +485,12 @@ def main():
         "--supcon-alpha", type=float, default=0.5,
         help="Max weight for SupCon loss in stage 2 (ramped over first 10 epochs)",
     )
+    parser.add_argument(
+        "--enc-aux-weight", type=float, default=0.5,
+        help="Weight for the auxiliary encoder classification loss (default 0.5). "
+             "Set to 0 to disable. Gives encoder a direct gradient path, "
+             "bypassing the decoder, which dramatically improves encoder embedding quality.",
+    )
     args = parser.parse_args()
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -524,6 +584,19 @@ def main():
         head = SegHead(head_in, num_classes).to(device)
         print(f"  SegHead: {head_in}→{num_classes} classes")
 
+    # ── Encoder auxiliary head ────────────────────────────────────────────────
+    enc_cache      = {}
+    enc_aux_head   = None
+    enc_hook_handle = None
+    if head_type == "global_cls" and args.enc_aux_weight > 0:
+        enc_channels = CFG["model_kwargs"]["enc_channels"][-1]  # 256
+        enc_aux_head = EncAuxHead(enc_channels, num_classes).to(device)
+        enc_hook_handle = model.enc.register_forward_hook(
+            EncAuxHead.make_hook(enc_cache)
+        )
+        print(f"  EncAuxHead: {enc_channels}→pool→{num_classes} classes  "
+              f"(enc_aux_weight={args.enc_aux_weight})")
+
     # ── Load checkpoint for stage 2 ───────────────────────────────────────────
     if args.stage == 2:
         if args.checkpoint is None:
@@ -535,8 +608,11 @@ def main():
               f"(epoch {ckpt_data.get('epoch','?')})")
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
+    opt_params = list(model.parameters()) + list(head.parameters())
+    if enc_aux_head is not None:
+        opt_params += list(enc_aux_head.parameters())
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(head.parameters()),
+        opt_params,
         lr=args.lr,
         weight_decay=CFG["weight_decay"],
     )
@@ -596,6 +672,9 @@ def main():
             head_type=head_type,
             supcon_criterion=supcon_criterion,
             supcon_alpha=current_alpha,
+            enc_aux_head=enc_aux_head,
+            enc_cache=enc_cache,
+            enc_aux_weight=args.enc_aux_weight,
         )
 
         val_loss, val_metric = validate(
@@ -630,9 +709,13 @@ def main():
                 "dataset":      args.dataset,
                 "head_type":    head_type,
                 "stage":        args.stage,
+                "enc_aux_head": enc_aux_head.state_dict() if enc_aux_head else None,
             }
             torch.save(ckpt, "best_model.pth")
             print(f"  >> checkpoint saved  (best val {metric_name} = {best_metric:.4f})")
+
+    if enc_hook_handle is not None:
+        enc_hook_handle.remove()
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
