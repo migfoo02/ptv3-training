@@ -83,25 +83,20 @@ def parse_stem(stem: str):
 
 def _rhino_mesh_to_arrays(mesh):
     """
-    Convert a rhino3dm.Mesh to (verts float64[V,3], normals float32[V,3], faces int64[F,3]).
+    Convert a rhino3dm.Mesh to (verts float64[V,3], faces int64[F,3]).
 
-    rhino3dm 8.x exposes Vertices / Faces / Normals as iterables, not indexable lists,
+    rhino3dm 8.x exposes Vertices / Faces as iterables, not indexable lists,
     so we use list() to collect them.  Face tuples are (i0,i1,i2,i3); a quad has
-    i2≠i3 and is split into two triangles.
+    i2≠i3 and is split into two triangles.  Per-point normals are computed later
+    from face cross-products during area-weighted sampling.
     """
-    verts_raw   = list(mesh.Vertices)   # Point3f objects with .X .Y .Z
-    faces_raw   = list(mesh.Faces)      # tuples (i0, i1, i2, i3)
-    normals_raw = list(mesh.Normals)    # Vector3f objects (may be empty)
+    verts_raw = list(mesh.Vertices)   # Point3f objects with .X .Y .Z
+    faces_raw = list(mesh.Faces)      # tuples (i0, i1, i2, i3)
 
     if not verts_raw or not faces_raw:
-        return None, None, None
+        return None, None
 
     verts = np.array([[v.X, v.Y, v.Z] for v in verts_raw], dtype=np.float64)
-
-    if len(normals_raw) == len(verts_raw):
-        normals = np.array([[n.X, n.Y, n.Z] for n in normals_raw], dtype=np.float32)
-    else:
-        normals = None   # will be computed from face normals after sampling
 
     face_list = []
     for fc in faces_raw:
@@ -111,10 +106,10 @@ def _rhino_mesh_to_arrays(mesh):
             face_list.append([i0, i2, i3])
 
     if not face_list:
-        return None, None, None
+        return None, None
 
     faces = np.array(face_list, dtype=np.int64)
-    return verts, normals, faces
+    return verts, faces
 
 
 def _collect_meshes_from_file(path: str):
@@ -165,8 +160,8 @@ def _collect_meshes_from_file(path: str):
                 pass
 
         for mesh in sub_meshes:
-            verts, _, faces = _rhino_mesh_to_arrays(mesh)
-            if verts is None:
+            verts, faces = _rhino_mesh_to_arrays(mesh)
+            if verts is None or faces is None:
                 continue
 
             all_verts.append(verts)

@@ -16,7 +16,7 @@ SWISS Competition Forms/
 data_npy/
 
 # Visualisation outputs
-*.png
+# *.png
 latent_*.npz
 
 # Virtual environments

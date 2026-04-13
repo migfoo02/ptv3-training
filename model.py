@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 try:
-    import spconv.pytorch as spconv
+    import spconv.pytorch as spconv #type: ignore
 except ImportError:
     print("SpConv not found. Using Mac Compatibility Mock.")
     from types import SimpleNamespace
@@ -754,9 +754,9 @@ class SerializedPooling(PointModule):
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
         point = Point(point_dict)
-        if self.norm is not None:
+        if hasattr(self, "norm"):
             point = self.norm(point)
-        if self.act is not None:
+        if hasattr(self, "act"):
             point = self.act(point)
         point.sparsify()
         return point
@@ -1031,39 +1031,37 @@ class PointTransformerV3(PointModule):
             point = self.dec(point)
         return point
 
-# Assuming you have 10,000 points
-num_points = 10000
-# 1. "coord": The raw XYZ coordinates of your points (Shape: [N, 3])
-coords = torch.rand(num_points, 3) * 10.0 
-# 2. "feat": The features of your points. 
-# MUST match 'in_channels' (Default is 6, e.g., XYZ + RGB)
-feats = torch.randn(num_points, 6) 
-# 3. "batch": Tells the model which points belong to which point cloud in a batch.
-# If you are only passing ONE point cloud at a time, it's just an array of zeros.
-batch = torch.zeros(num_points, dtype=torch.long)
-# 4. Construct the dictionary
-data_dict = {
-    "coord": coords,
-    "feat": feats,
-    "batch": batch,
-    "grid_size": 0.05  # Defines how small the voxel grid is for downsampling
-}
-
 if __name__ == "__main__":
     print("--- Starting Mac Compatibility Test ---")
-    
+
+    # Assuming you have 10,000 points
+    num_points = 10000
+    # 1. "coord": The raw XYZ coordinates of your points (Shape: [N, 3])
+    coords = torch.rand(num_points, 3) * 10.0
+    # 2. "feat": The features of your points.
+    # MUST match 'in_channels' (Default is 6, e.g., XYZ + RGB)
+    feats = torch.randn(num_points, 6)
+    # 3. "batch": Tells the model which points belong to which point cloud in a batch.
+    # If you are only passing ONE point cloud at a time, it's just an array of zeros.
+    batch = torch.zeros(num_points, dtype=torch.long)
+    # 4. Construct the dictionary
+    data_dict = {
+        "coord": coords,
+        "feat": feats,
+        "batch": batch,
+        "grid_size": 0.05,  # Defines how small the voxel grid is for downsampling
+    }
+
     print("Initializing PointTransformerV3 with default parameters...")
     model = PointTransformerV3()
     print("Model initialized successfully!")
 
     print("\n--- Input Data ---")
     print(f"Total Points: {num_points}")
-    # print(f"Coordinate shape: {data_dict['coord'].shape}")
-    # print(f"Feature shape: {data_dict['feat'].shape}")
 
     print("\nRunning forward pass (this might take a few seconds on CPU/MPS)...")
     # Using model(data_dict) is the standard PyTorch way instead of model.forward()
-    output = model(data_dict) 
+    output = model(data_dict)
     
     print("\n✅ SUCCESS! Forward pass completed.")
     print("--- Output Data ---")
