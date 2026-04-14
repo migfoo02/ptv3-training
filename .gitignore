@@ -13,7 +13,7 @@ SWISS Competition Forms/
 *.xlsx
 
 # Converted point cloud cache (derived output — regenerate with convert_3dm.py)
-data_npy/
+# data_npy
 
 # Visualisation outputs
 # *.png
